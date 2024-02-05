@@ -1,0 +1,163 @@
+import cv2
+import pytesseract
+import os
+import time
+from openpyxl import Workbook, load_workbook
+
+# Path to the Haar cascade XML file
+harcascade = "model/haarcascade_russian_plate_number.xml"
+
+# Create directory to save images if it doesn't exist
+save_dir = "plates"
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
+
+# Function to extract text from the processed image
+def extract_text(image):
+    # Convert image to grayscale for better OCR accuracy
+    img_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Preprocess the image for better OCR accuracy
+    img_blurred = cv2.GaussianBlur(img_gray, (5, 5), 0)
+    _, img_thresholded = cv2.threshold(img_blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Perform OCR on the preprocessed image
+    try:
+        extracted_text = pytesseract.image_to_string(img_thresholded, lang='eng')
+        return extracted_text.strip()  # Strip leading/trailing whitespace
+    except Exception as e:
+        print("Error occurred during text extraction:", e)
+        return None
+
+# Video capture initialization
+cap = cv2.VideoCapture(1)
+cap.set(3, 640)  # Set width
+cap.set(4, 480)  # Set height
+
+# Minimum area threshold for plate detection
+min_area = 500
+count = 1  # Initial value for S.N.
+
+# Timer for controlling plate detection frequency and text extraction interval
+prev_time_detection = time.time()
+detection_interval = 2  # Detection interval in seconds
+
+# Maximum number of text extractions
+max_extraction_count = 5
+extraction_count = 0
+
+# Check if Excel file already exists
+excel_file_path = "plate_data.xlsx"
+if os.path.exists(excel_file_path):
+    # Load existing data from Excel file
+    wb = load_workbook(excel_file_path)
+    ws = wb.active
+else:
+    # Create a new Excel file and add header
+    wb = Workbook()
+    ws = wb.active
+    ws.append(['S.N.', 'Car License Plate Number', 'Saved Original Image Filename', 'Saved Processed Image Filename'])
+
+# Main loop for video capture and processing
+while True:
+    success, img = cap.read()
+
+    # Convert image to grayscale for plate detection
+    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Detect plates using Haar cascade
+    plate_cascade = cv2.CascadeClassifier(harcascade)
+    plates = plate_cascade.detectMultiScale(img_gray, 1.1, 4)
+
+    # Process detected plates
+    for (x, y, w, h) in plates:
+        area = w * h
+
+        if area > min_area:
+            # Draw rectangle around detected plate
+            cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            
+            # Crop the detected plate region for OCR
+            plate_roi = img[y:y+h, x:x+w]
+
+            # Apply additional preprocessing to the plate region
+            plate_roi_preprocessed = cv2.GaussianBlur(plate_roi, (5, 5), 0)
+            plate_roi_gray = cv2.cvtColor(plate_roi_preprocessed, cv2.COLOR_BGR2GRAY)  # Convert to grayscale
+            _, plate_roi_thresholded = cv2.threshold(plate_roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            plate_roi_thresholded = cv2.erode(plate_roi_thresholded, None, iterations=1)
+            plate_roi_thresholded = cv2.dilate(plate_roi_thresholded, None, iterations=1)
+
+            # Display the processed image in a separate window
+            cv2.imshow("Processed Image", plate_roi_thresholded)
+            cv2.moveWindow("Processed Image", 700, 100)  # Move the window to a specific location
+
+            # Find contours in the plate region
+            contours, _ = cv2.findContours(plate_roi_thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Process each contour
+            for contour in contours:
+                # Calculate the contour area
+                contour_area = cv2.contourArea(contour)
+
+                # Filter contours based on area
+                if contour_area > min_area:
+                    # Get the bounding box of the contour
+                    x_contour, y_contour, w_contour, h_contour = cv2.boundingRect(contour)
+
+                    # Calculate the aspect ratio of the contour's bounding box
+                    aspect_ratio = float(w_contour) / h_contour
+
+                    # Filter contours based on aspect ratio
+                    if 1.5 <= aspect_ratio <= 5.0:
+                        # Draw a rectangle around the contour
+                        cv2.rectangle(plate_roi, (x_contour, y_contour), (x_contour + w_contour, y_contour + h_contour), (0, 255, 0), 2)
+
+                        # Extract text from the processed contour
+                        extracted_text = extract_text(plate_roi)
+                        if extracted_text is not None:
+                            print("Extracted Text:", extracted_text)
+
+                            # Save only the ROI part of the original image with a unique filename based on timestamp
+                            original_roi_path = os.path.join(save_dir, f"original_roi_{int(time.time())}_{count}.jpg")
+                            cv2.imwrite(original_roi_path, plate_roi)
+                            print("Original ROI Image Saved:", original_roi_path)
+
+                            # Save the processed image with a unique filename based on timestamp
+                            processed_img_path = os.path.join(save_dir, f"processed_img_{int(time.time())}_{count}.jpg")
+                            cv2.imwrite(processed_img_path, plate_roi_thresholded)
+                            print("Processed Image Saved:", processed_img_path)
+
+                            # Append data to Excel file with hyperlink formula
+                            hyperlink_original = f'=HYPERLINK("{original_roi_path}", "View Original ROI Image {count}")'
+                            hyperlink_processed = f'=HYPERLINK("{processed_img_path}", "View Processed Image {count}")'
+                            try:
+                                ws.append([count, extracted_text, hyperlink_original, hyperlink_processed])
+                            except Exception as e:
+                                print("Error occurred while writing to Excel:", e)
+
+                            count += 1
+
+                            # Increment extraction count and check if maximum count reached
+                            extraction_count += 1
+                            if extraction_count >= max_extraction_count:
+                                # Save updated Excel file
+                                try:
+                                    wb.save(excel_file_path)
+                                    print("Data saved to:", excel_file_path)
+                                except Exception as e:
+                                    print("Error occurred while saving Excel file:", e)
+                                exit()  # Exit the program
+
+    # Display the original frame with detected plates
+    cv2.imshow("Result", img)
+
+    # Exit loop when 'q' key is pressed
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+    # Add 2 seconds delay
+    time.sleep(2)
+
+# Release video capture and close all windows
+cap.release()
+cv2.destroyAllWindows()
